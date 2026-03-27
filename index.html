@@ -1,0 +1,9 @@
+---
+---
+{% assign js_files = site.static_files | where: "extname", ".js" | sort: "name" %}
+
+<ul>
+{% for file in js_files %}
+  <li><a href="{{ file.path | relative_url }}">{{ file.name }}</a></li>
+{% endfor %}
+</ul>
