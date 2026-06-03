@@ -456,7 +456,7 @@
 
                 const top = document.createElement('div');
                 const time = document.createElement('span');
-                time.textContent = `${formatTime(n.start)} → ${formatTime(n.end)} `;
+                time.textContent = `${formatTime(n.start)}-${formatTime(n.end)} `;
 
                 const go = document.createElement('span');
                 go.textContent = 'go';
@@ -650,7 +650,7 @@
             row.style.display = '';
 
             // Update mutable fields
-            row.querySelector('.time').textContent = `${formatTime(n.start)} → ${formatTime(n.end)} `;
+            row.querySelector('.time').textContent = `${formatTime(n.start)}-${formatTime(n.end)} `;
             row.querySelector('.text').textContent = n.text || '';
             row.style.background = (now >= n.start && now <= n.end) ? '#2a3a2a' : '';
         }
