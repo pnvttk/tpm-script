@@ -1,8 +1,10 @@
 // ==UserScript==
-// @name         YouTube Timestamp Notes v0.8.5
+// @name         YouTube + Twitch Timestamp Notes
 // @namespace    yt-notes
-// @version      0.8.5
-// @match        https://www.youtube.com/*
+// @version      1.0.0
+// @match        https://www.youtube.com/watch*
+// @match        https://www.twitch.tv/videos/*
+// @match        https://www.twitch.tv/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // ==/UserScript==
@@ -12,24 +14,88 @@
 
     let startTime = null;
     let mode = 'capture';
+    let currentNotesCollapsed = false;
+
+    const currentNoteRows = new Map();
+    let lastRenderedVid = null;
+    let lastRenderedNoteCount = 0;
+
+    // ---------------- SITE DETECTION ----------------
+    // Returns fresh site info on every call — safe for SPA navigation.
+    function getSite() {
+        const host = location.hostname;
+
+        if (host.includes('youtube.com')) {
+            return {
+                type: 'youtube',
+                getVideo: () => document.querySelector('video'),
+                getVideoId: () => new URL(location.href).searchParams.get('v'),
+                getTitle: () => document.title,
+                getCurrentTime: () => document.querySelector('video')?.currentTime ?? 0,
+                goToNote(note, vid) {
+                    if (this.getVideoId() === vid) {
+                        const v = this.getVideo();
+                        if (v) v.currentTime = note.start;
+                    } else {
+                        window.open(
+                            `https://www.youtube.com/watch?v=${vid}&t=${Math.floor(note.start)}s`,
+                            '_blank'
+                        );
+                    }
+                }
+            };
+        }
+
+        if (host.includes('twitch.tv')) {
+            const vodMatch = location.pathname.match(/\/videos\/(\d+)/);
+            const vodId = vodMatch ? vodMatch[1] : null;
+            const channel = location.pathname.split('/').filter(Boolean)[0] || null;
+
+            return {
+                type: 'twitch',
+                getVideo: () => document.querySelector('video'),
+                getVideoId: () => vodId ? `vod:${vodId}` : (channel ? `live:${channel}` : null),
+                getTitle: () => document.title,
+                getCurrentTime: () => document.querySelector('video')?.currentTime ?? 0,
+                goToNote(note, vid) {
+                    if (this.getVideoId() === vid) {
+                        const v = this.getVideo();
+                        if (v) v.currentTime = note.start;
+
+                        return;
+                    }
+                    if (vid.startsWith('vod:')) {
+                        const id = vid.replace('vod:', '');
+                        const sec = Math.floor(note.start);
+                        const h = Math.floor(sec / 3600);
+                        const m = Math.floor((sec % 3600) / 60);
+                        const s = sec % 60;
+                        // Twitch expects ?t=1h2m3s format
+                        const ts = `${h}h${String(m).padStart(2, '0')}m${String(s).padStart(2, '0')}s`;
+                        window.open(`https://www.twitch.tv/videos/${id}?t=${ts}`, '_blank');
+
+                        return;
+                    }
+                    if (vid.startsWith('live:')) {
+                        window.open(`https://www.twitch.tv/${vid.replace('live:', '')}`, '_blank');
+                    }
+                }
+            };
+        }
+
+        return null;
+    }
+
+    // Convenience wrappers — always use fresh getSite()
+    function getVideo() { return getSite()?.getVideo(); }
+    function getVideoId() { return getSite()?.getVideoId(); }
+    function getCurrentTime() { return getSite()?.getCurrentTime() ?? 0; }
 
     // ---------------- STORAGE ----------------
-    function getNotes() {
-        return GM_getValue('ytNotes', {});
-    }
-    function saveNotes(d) {
-        GM_setValue('ytNotes', d);
-    }
+    function getNotes() { return GM_getValue('ytNotes', {}); }
+    function saveNotes(d) { GM_setValue('ytNotes', d); }
 
     // ---------------- HELPERS ----------------
-    function getVideo() {
-        return document.querySelector('video');
-    }
-
-    function getVideoId() {
-        return new URL(location.href).searchParams.get('v');
-    }
-
     function formatTime(sec) {
         sec = Math.floor(sec);
         const h = Math.floor(sec / 3600);
@@ -39,20 +105,9 @@
         return [h, m, s].map(v => String(v).padStart(2, '0')).join(':');
     }
 
-    // ---------------- NAVIGATION ----------------
-    function goToNote(n, vid) {
-        const current = getVideoId();
-
-        if (vid === current) {
-            const v = getVideo();
-            if (v) {
-                v.currentTime = n.start;
-            }
-        } else {
-            const url = `https://www.youtube.com/watch?v=${vid}&t=${Math.floor(n.start)}s`;
-
-            window.open(url, '_blank');
-        }
+    function generateId() {
+        // Combines timestamp + random suffix to avoid same-millisecond collisions
+        return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     }
 
     // ---------------- FEEDBACK ----------------
@@ -60,18 +115,16 @@
         const d = document.createElement('div');
         d.textContent = msg;
         d.style.cssText = `
-        position:absolute;
-        top:-24px;
-        left:0;
-        width:100%;
-        background:#ff0;
-        color:#000;
-        font-size:11px;
-        text-align:center;
-        padding:2px;
-        border-radius:4px;
-    `;
-
+            position:absolute;
+            top:-24px;
+            left:0;
+            width:100%;
+            background:#ff0;
+            color:#000;
+            text-align:center;
+            padding:2px;
+            border-radius:4px;
+        `;
         panel.appendChild(d);
         setTimeout(() => d.remove(), 1200);
     }
@@ -79,17 +132,25 @@
     // ---------------- SAVE NOTE ----------------
     function saveNote(end, text, tags) {
         const vid = getVideoId();
-        const data = getNotes();
+        const site = getSite();
+
+        if (!vid) { tip('Not a video page'); return; }
+
+        const data = getNotes(); // always fresh
 
         if (!data[vid]) {
             data[vid] = {
-                title: document.title,
+                site: site?.type || 'unknown',
+                title: site?.getTitle() || document.title, // read dynamically
                 url: location.href,
+                created: new Date().toISOString(),
                 notes: []
             };
         }
 
         data[vid].notes.push({
+            id: generateId(),  // collision-safe ID
+            site: site?.type,
             start: startTime,
             end,
             text,
@@ -99,226 +160,307 @@
 
         saveNotes(data);
         startTime = null;
-        render();
+        renderCurrentVideoNotes();
     }
 
-    // ---------------- UI ----------------
+    // ---------------- UI CONSTRUCTION ----------------
+    function makeLink(text) {
+        const el = document.createElement('span');
+        el.textContent = text;
+        el.style.cssText = `
+            color:#6cf;
+            cursor:pointer;
+            text-decoration:underline;
+            margin-right:10px;
+            user-select:none;
+        `;
+
+        return el;
+    }
+
+    const UI_FONT_SIZE = '14px';
+    function applyUIFont(el) {
+        el.style.fontSize = UI_FONT_SIZE;
+    }
+
     const panel = document.createElement('div');
     panel.style.cssText = `
-position:fixed;
-top:80px;
-right:20px;
-width:380px;
-background:#1e1e1e;
-color:white;
-z-index:999999;
-padding:10px;
-border-radius:8px;
-font-family:sans-serif;
-display:none;
-`;
+        position:fixed;
+        top:80px;
+        right:20px;
+        width:380px;
+        background:#1e1e1e;
+        color:white;
+        z-index:999999;
+        padding:10px;
+        border-radius:8px;
+        font-family:sans-serif;
+        display:none;
+    `;
 
     const header = document.createElement('div');
-    header.textContent = 'YT Notes';
+    header.textContent = 'Video Notes';
     header.style.cssText = 'font-weight:bold;cursor:move;margin-bottom:6px;';
 
-    const toggleMode = document.createElement('button');
-    toggleMode.textContent = 'Switch View';
-
-    // capture mode
-    const startBtn = document.createElement('button');
-    startBtn.textContent = 'Start';
-
-    const saveBtn = document.createElement('button');
-    saveBtn.textContent = 'Save';
+    const startBtn = makeLink('start');
+    const saveBtn = makeLink('save');
+    const toggleMode = makeLink('view');
+    const exportAllBtn = makeLink('export all');
+    const clearAllBtn = makeLink('clear all');
 
     const ta = document.createElement('textarea');
-    ta.style.cssText = 'width:100%;height:50px;margin-top:6px;';
+    ta.style.cssText = 'width:100%;height:50px;margin-top:6px;box-sizing:border-box;';
 
-    const tag = document.createElement('input');
-    tag.placeholder = 'tags (comma separated)';
-    tag.style.cssText = 'width:100%;margin-top:6px;';
-
-    // view mode
-    const exportAllBtn = document.createElement('button');
-    exportAllBtn.textContent = 'Export All';
-
-    const clearAllBtn = document.createElement('button');
-    clearAllBtn.textContent = 'Clear All';
+    const tagInput = document.createElement('input');
+    tagInput.placeholder = 'tags (comma separated)';
+    tagInput.style.cssText = 'width:100%;margin-top:6px;box-sizing:border-box;';
 
     const search = document.createElement('input');
     search.placeholder = 'search...';
-    search.style.cssText = 'width:100%;margin-top:6px;';
+    search.style.cssText = 'width:100%;margin-top:6px;box-sizing:border-box;';
 
     const list = document.createElement('div');
-    list.style.cssText = 'max-height:320px;overflow-y:auto;margin-top:6px;font-size:12px;';
+    list.style.cssText = 'max-height:320px;overflow-y:auto;margin-top:6px;';
 
-    // ---------------- LAYOUT ----------------
+    const currentNotes = document.createElement('div');
+    currentNotes.style.cssText = `
+        margin-top:10px;
+        max-height:220px;
+        overflow-y:auto;
+        border-top:1px solid #333;
+        padding-top:6px;
+    `;
+
+    applyUIFont(header);
+    applyUIFont(startBtn);
+    applyUIFont(saveBtn);
+    applyUIFont(toggleMode);
+    applyUIFont(exportAllBtn);
+    applyUIFont(clearAllBtn);
+    applyUIFont(ta);
+    applyUIFont(tagInput);
+    applyUIFont(search);
+    applyUIFont(list);
+    applyUIFont(currentNotes);
+
     panel.appendChild(header);
     panel.appendChild(toggleMode);
-
     panel.appendChild(exportAllBtn);
     panel.appendChild(clearAllBtn);
     panel.appendChild(startBtn);
     panel.appendChild(saveBtn);
     panel.appendChild(ta);
-    panel.appendChild(tag);
+    panel.appendChild(tagInput);
     panel.appendChild(search);
     panel.appendChild(list);
-
+    panel.appendChild(currentNotes);
     document.body.appendChild(panel);
 
-    // floating toggle button
+    // Floating toggle button
     const btn = document.createElement('button');
     btn.textContent = '☰';
     btn.style.cssText = `
-position:fixed;
-top:80px;
-right:20px;
-z-index:1000000;
-background:#f33;
-color:white;
-padding:6px;
-border-radius:4px;
-`;
+        position:fixed;
+        top:80px;
+        right:20px;
+        z-index:1000000;
+        background:#f33;
+        color:white;
+        padding:6px;
+        border-radius:4px;
+        border:none;
+        cursor:pointer;
+    `;
     document.body.appendChild(btn);
 
     btn.onclick = () => {
         panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
-        render();
+        if (panel.style.display === 'block') render();
     };
 
     // ---------------- DRAG ----------------
-    let drag = 0, ox = 0, oy = 0;
-    header.onmousedown = e => {
-        drag = 1;
+    let drag = false, ox = 0, oy = 0;
+
+    header.onmousedown = (e) => {
+        drag = true;
         ox = e.clientX - panel.offsetLeft;
         oy = e.clientY - panel.offsetTop;
     };
-    document.onmousemove = e => {
+    document.addEventListener('mousemove', (e) => {
         if (!drag) return;
+
         panel.style.left = (e.clientX - ox) + 'px';
         panel.style.top = (e.clientY - oy) + 'px';
         panel.style.right = 'auto';
+    });
+    document.addEventListener('mouseup', () => { drag = false; });
+
+    // ---------------- URL CHANGE DETECTION ----------------
+    let lastUrl = location.href;
+
+    const observePageChanges = () => {
+        const observer = new MutationObserver(() => {
+            if (location.href === lastUrl) return;
+
+            lastUrl = location.href;
+
+            // Reset capture state on navigation
+            startTime = null;
+
+            // Force full re-render of current-video pane
+            lastRenderedVid = null;
+            currentNoteRows.clear();
+            currentNotes.textContent = '';
+
+            setTimeout(() => {
+                if (panel.style.display !== 'none') render();
+            }, 500);
+        });
+        observer.observe(document.body, { childList: true, subtree: true });
     };
-    document.onmouseup = () => drag = 0;
+    observePageChanges();
 
-    // ---------------- RENDER ----------------
+    // Lightweight polling: only re-render if note count changed
+    setInterval(() => {
+        if (panel.style.display === 'none' || mode !== 'capture') return;
+
+        const vid = getVideoId();
+        if (!vid) return;
+
+        const data = getNotes();
+        const noteCount = data[vid]?.notes?.length ?? 0;
+
+        if (noteCount !== lastRenderedNoteCount || vid !== lastRenderedVid) {
+            lastRenderedNoteCount = noteCount;
+            renderCurrentVideoNotes();
+        }
+    }, 1000);
+
+    // ---------------- RENDER (view mode) ----------------
     function render() {
-
         const isCapture = mode === 'capture';
 
+        currentNotes.style.display = isCapture ? 'block' : 'none';
         startBtn.style.display = isCapture ? 'inline' : 'none';
         saveBtn.style.display = isCapture ? 'inline' : 'none';
         ta.style.display = isCapture ? 'block' : 'none';
-        tag.style.display = isCapture ? 'block' : 'none';
+        tagInput.style.display = isCapture ? 'block' : 'none';
 
         exportAllBtn.style.display = !isCapture ? 'inline' : 'none';
         clearAllBtn.style.display = !isCapture ? 'inline' : 'none';
         search.style.display = !isCapture ? 'block' : 'none';
         list.style.display = !isCapture ? 'block' : 'none';
 
-        if (isCapture) return;
+        if (isCapture) {
+            renderCurrentVideoNotes();
 
+            return;
+        }
+
+        renderViewMode();
+    }
+
+    function renderViewMode() {
         while (list.firstChild) list.removeChild(list.firstChild);
 
         const data = getNotes();
         const q = search.value.toLowerCase();
 
         Object.entries(data).forEach(([vid, v]) => {
-
             const group = document.createElement('div');
             group.style.cssText = 'border:1px solid #333;margin-bottom:8px;padding:4px;';
 
-            const title = document.createElement('div');
-            title.textContent = v.title;
-            title.style.cssText = 'font-weight:bold;cursor:pointer;background:#333;padding:3px;';
+            const titleBar = document.createElement('div');
+            titleBar.textContent = v.title;
+            titleBar.style.cssText = 'font-weight:bold;cursor:pointer;background:#333;padding:3px;';
 
-            // clear per video
-            const clear = document.createElement('span');
-            clear.textContent = ' clear';
-            clear.style.cssText = 'color:#f88;cursor:pointer;text-decoration:underline;margin-left:6px;';
-            clear.onclick = (e) => {
+            // Per-video clear
+            const clearVid = document.createElement('span');
+            clearVid.textContent = ' clear';
+            clearVid.style.cssText = 'color:#f88;cursor:pointer;margin-left:6px;';
+            clearVid.onclick = (e) => {
                 e.stopPropagation();
-                if (confirm('Delete all notes for this video?')) {
-                    delete data[vid];
-                    saveNotes(data);
-                    render();
-                }
+                if (!confirm('Delete all notes for this video?')) return;
+
+                const d = getNotes(); // fresh read
+                delete d[vid];
+                saveNotes(d);
+                renderViewMode();
             };
 
-            // export per video
+            // Per-video export
             const exportVid = document.createElement('span');
             exportVid.textContent = ' export';
-            exportVid.style.cssText = 'color:#0af;cursor:pointer;text-decoration:underline;margin-left:6px;';
+            exportVid.style.cssText = 'color:#0af;cursor:pointer;margin-left:6px;';
             exportVid.onclick = (e) => {
                 e.stopPropagation();
                 const blob = new Blob([JSON.stringify(v, null, 2)], { type: 'application/json' });
                 const a = document.createElement('a');
                 a.href = URL.createObjectURL(blob);
-                a.download = `yt-notes-${vid}.json`;
+                a.download = `yt-notes-${vid.replace(/[^a-z0-9]/gi, '_')}.json`;
                 a.click();
+                URL.revokeObjectURL(a.href);
             };
 
-            title.appendChild(clear);
-            title.appendChild(exportVid);
+            titleBar.appendChild(clearVid);
+            titleBar.appendChild(exportVid);
 
             let collapsed = false;
             const box = document.createElement('div');
 
-            title.onclick = () => {
+            titleBar.onclick = () => {
                 collapsed = !collapsed;
                 box.style.display = collapsed ? 'none' : 'block';
             };
 
             (v.notes || []).forEach((n, i) => {
-
                 const match =
                     (n.text || '').toLowerCase().includes(q) ||
                     (n.tags || []).join(',').toLowerCase().includes(q);
-
                 if (!match) return;
 
                 const row = document.createElement('div');
                 row.style.cssText = 'margin:6px 0;padding:4px;border-bottom:1px solid #222;';
 
-                // top line
                 const top = document.createElement('div');
-
                 const time = document.createElement('span');
                 time.textContent = `${formatTime(n.start)} → ${formatTime(n.end)} `;
-                time.style.textDecoration = 'underline';
 
                 const go = document.createElement('span');
                 go.textContent = 'go';
-                go.style.cssText = 'color:#0af;cursor:pointer;text-decoration:underline;margin-left:6px;';
-                go.onclick = () => goToNote(n, vid);
+                go.style.cssText = 'color:#0af;cursor:pointer;margin-left:6px;';
+                go.onclick = () => getSite()?.goToNote(n, vid);
 
                 const edit = document.createElement('span');
                 edit.textContent = ' edit';
-                edit.style.cssText = 'color:#ff0;cursor:pointer;text-decoration:underline;margin-left:6px;';
+                edit.style.cssText = 'color:#ff0;cursor:pointer;margin-left:6px;';
                 edit.onclick = () => {
-                    const nt = prompt('edit text', n.text);
+                    const nt = prompt('Edit text', n.text);
                     if (nt === null) return;
 
-                    const tg = prompt('tags', (n.tags || []).join(','));
+                    const tg = prompt('Tags', (n.tags || []).join(','));
 
-                    n.text = nt;
-                    n.tags = tg ? tg.split(',').map(t => t.trim()) : [];
+                    // Always read fresh before writing
+                    const d = getNotes();
+                    const note = d[vid]?.notes?.[i];
+                    if (!note) return;
 
-                    saveNotes(data);
-                    render();
+                    note.text = nt;
+                    note.tags = tg ? tg.split(',').map(t => t.trim()).filter(Boolean) : [];
+                    saveNotes(d);
+                    renderViewMode();
                 };
 
                 const del = document.createElement('span');
                 del.textContent = ' del';
-                del.style.cssText = 'color:#f55;cursor:pointer;text-decoration:underline;margin-left:6px;';
+                del.style.cssText = 'color:#f55;cursor:pointer;margin-left:6px;';
                 del.onclick = () => {
-                    if (confirm('delete?')) {
-                        v.notes.splice(i, 1);
-                        saveNotes(data);
-                        render();
-                    }
+                    if (!confirm('Delete this note?')) return;
+
+                    const d = getNotes(); // fresh read
+                    d[vid]?.notes?.splice(i, 1);
+                    saveNotes(d);
+                    renderViewMode();
                 };
 
                 top.appendChild(time);
@@ -326,61 +468,229 @@ border-radius:4px;
                 top.appendChild(edit);
                 top.appendChild(del);
 
-                // second line
-                const text = document.createElement('div');
-                text.textContent = n.text;
-                text.style.cssText = 'margin-left:6px;color:#ccc;margin-top:2px;';
+                const textEl = document.createElement('div');
+                textEl.textContent = n.text;
+                textEl.style.cssText = 'color:#ccc;margin-top:2px;';
 
                 row.appendChild(top);
-                row.appendChild(text);
+                row.appendChild(textEl);
                 box.appendChild(row);
-
             });
 
-            group.appendChild(title);
+            group.appendChild(titleBar);
             group.appendChild(box);
             list.appendChild(group);
-
         });
+    }
+
+    // ---------------- RENDER (current video notes) ----------------
+    function renderCurrentVideoNotes() {
+        const vid = getVideoId();
+
+        // If no video, wipe and bail
+        if (!vid) {
+            currentNotes.textContent = '';
+            currentNoteRows.clear();
+            lastRenderedVid = null;
+
+            return;
+        }
+
+        const data = getNotes();
+        const videoData = data[vid];
+        const notes = videoData?.notes ?? [];
+
+        // Video changed — full reset
+        if (lastRenderedVid !== vid) {
+            currentNotes.textContent = '';
+            currentNoteRows.clear();
+            lastRenderedVid = null;
+        }
+
+        // Ensure header exists
+        if (!currentNotes.querySelector('.cn-header')) {
+            const hdr = document.createElement('div');
+            hdr.className = 'cn-header';
+            hdr.style.cssText = 'font-weight:bold;margin-bottom:6px;cursor:pointer;';
+            hdr.onclick = () => {
+                currentNotesCollapsed = !currentNotesCollapsed;
+                renderCurrentVideoNotes();
+            };
+            currentNotes.appendChild(hdr);
+        }
+
+        const hdr = currentNotes.querySelector('.cn-header');
+        hdr.textContent = currentNotesCollapsed
+            ? '▶ Current Video Notes'
+            : '▼ Current Video Notes';
+
+        // After we know the header is safe, set lastRenderedVid
+        lastRenderedVid = vid;
+
+        if (currentNotesCollapsed) {
+            // Hide all note rows but keep header
+            for (const row of currentNoteRows.values()) row.style.display = 'none';
+
+            return;
+        }
+
+        const now = getCurrentTime();
+        const validIds = new Set();
+
+        for (const n of notes) {
+            // Use n.id (new field) with n.created as fallback for old notes
+            const id = n.id ?? n.created;
+            validIds.add(id);
+
+            let row = currentNoteRows.get(id);
+
+            if (!row) {
+                row = document.createElement('div');
+                row.style.cssText =
+                    'margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid #222;';
+
+                const top = document.createElement('div');
+                const timeEl = document.createElement('span');
+                timeEl.className = 'time';
+
+                const go = document.createElement('span');
+                go.textContent = ' go';
+                go.style.cssText = 'color:#0af;cursor:pointer;margin-left:6px;';
+                go.onclick = (e) => {
+                    e.stopPropagation();
+                    getSite()?.goToNote(n, vid);
+                };
+
+                const edit = document.createElement('span');
+                edit.textContent = ' edit';
+                edit.style.cssText = 'color:#ff0;cursor:pointer;margin-left:6px;';
+                edit.onclick = (e) => {
+                    e.stopPropagation();
+                    const nt = prompt('Edit text', n.text);
+                    if (nt === null) return;
+
+                    const tg = prompt('Tags', (n.tags || []).join(','));
+
+                    const d = getNotes(); // fresh read
+                    const note = d[vid]?.notes?.find(x => (x.id ?? x.created) === id);
+                    if (!note) return;
+
+                    note.text = nt;
+                    note.tags = tg ? tg.split(',').map(t => t.trim()).filter(Boolean) : [];
+                    saveNotes(d);
+                    renderCurrentVideoNotes();
+                };
+
+                const del = document.createElement('span');
+                del.textContent = ' del';
+                del.style.cssText = 'color:#f55;cursor:pointer;margin-left:6px;';
+                del.onclick = (e) => {
+                    e.stopPropagation();
+                    if (!confirm('Delete this note? This cannot be undone.')) return;
+
+                    const d = getNotes(); // fresh read
+                    const arr = d[vid]?.notes;
+                    if (arr) {
+                        const idx = arr.findIndex(x => (x.id ?? x.created) === id);
+                        if (idx !== -1) arr.splice(idx, 1);
+                    }
+                    saveNotes(d);
+
+                    row.remove();
+                    currentNoteRows.delete(id);
+                    renderCurrentVideoNotes();
+                };
+
+                const textEl = document.createElement('div');
+                textEl.className = 'text';
+                textEl.style.cssText = 'color:#ccc;margin-top:2px;';
+
+                top.appendChild(timeEl);
+                top.appendChild(go);
+                top.appendChild(edit);
+                top.appendChild(del);
+                row.appendChild(top);
+                row.appendChild(textEl);
+
+                currentNotes.appendChild(row);
+                currentNoteRows.set(id, row);
+            }
+
+            row.style.display = '';
+
+            // Update mutable fields
+            row.querySelector('.time').textContent = `${formatTime(n.start)} → ${formatTime(n.end)} `;
+            row.querySelector('.text').textContent = n.text || '';
+            row.style.background = (now >= n.start && now <= n.end) ? '#2a3a2a' : '';
+        }
+
+        // Remove rows for deleted notes
+        for (const [id, row] of currentNoteRows.entries()) {
+            if (!validIds.has(id)) {
+                row.remove();
+                currentNoteRows.delete(id);
+            }
+        }
+
+        // If no notes left, clean up header too
+        if (notes.length === 0) {
+            currentNotes.textContent = '';
+            currentNoteRows.clear();
+        }
     }
 
     // ---------------- EVENTS ----------------
     startBtn.onclick = () => {
-        startTime = getVideo().currentTime;
-        tip('Start saved');
+        const v = getVideo();
+        if (!v || v.readyState < 2) { tip('Video not ready'); return; }
+
+        startTime = getCurrentTime();
+        tip(`Start: ${formatTime(startTime)}`);
     };
 
     saveBtn.onclick = () => {
-        const end = getVideo().currentTime;
-        saveNote(end, ta.value, (tag.value || '').split(','));
+        if (startTime === null) { tip('Press Start first'); return; }
+
+        const end = getCurrentTime();
+        saveNote(
+            end,
+            ta.value,
+            (tagInput.value || '').split(',').map(t => t.trim()).filter(Boolean)
+        );
+
         tip('Note saved');
         ta.value = '';
-        tag.value = '';
+        tagInput.value = '';
     };
 
     toggleMode.onclick = () => {
         mode = mode === 'capture' ? 'view' : 'capture';
+        // Clear startTime when leaving capture mode to prevent stale captures
+        if (mode !== 'capture') startTime = null;
+        toggleMode.textContent = mode === 'capture' ? 'view' : 'capture';
         render();
     };
 
     exportAllBtn.onclick = () => {
         const blob = new Blob([JSON.stringify(getNotes(), null, 2)], { type: 'application/json' });
         const a = document.createElement('a');
-
         a.href = URL.createObjectURL(blob);
-        a.download = 'yt-notes-all.json';
+        a.download = `yt-notes-all.json`;
         a.click();
+        URL.revokeObjectURL(a.href);
     };
 
     clearAllBtn.onclick = () => {
-        if (confirm('Delete ALL notes from ALL videos? This cannot be undone.')) {
-            saveNotes({});
-            render();
-            tip('All notes cleared');
-        }
+        if (!confirm('Delete ALL notes from ALL videos? This cannot be undone.')) return;
+
+        saveNotes({});
+        render();
+        tip('All notes cleared');
     };
 
-    // init
+    search.oninput = () => renderViewMode();
+
+    // Init
     render();
 
 })();
