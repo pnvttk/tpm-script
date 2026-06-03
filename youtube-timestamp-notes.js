@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         YouTube + Twitch Timestamp Notes
 // @namespace    yt-notes
-// @version      1.0.0
+// @version      1.1.0
 // @match        https://www.youtube.com/watch*
 // @match        https://www.twitch.tv/videos/*
 // @match        https://www.twitch.tv/*
@@ -32,17 +32,6 @@
                 getVideoId: () => new URL(location.href).searchParams.get('v'),
                 getTitle: () => document.title,
                 getCurrentTime: () => document.querySelector('video')?.currentTime ?? 0,
-                goToNote(note, vid) {
-                    if (this.getVideoId() === vid) {
-                        const v = this.getVideo();
-                        if (v) v.currentTime = note.start;
-                    } else {
-                        window.open(
-                            `https://www.youtube.com/watch?v=${vid}&t=${Math.floor(note.start)}s`,
-                            '_blank'
-                        );
-                    }
-                }
             };
         }
 
@@ -57,29 +46,6 @@
                 getVideoId: () => vodId ? `vod:${vodId}` : (channel ? `live:${channel}` : null),
                 getTitle: () => document.title,
                 getCurrentTime: () => document.querySelector('video')?.currentTime ?? 0,
-                goToNote(note, vid) {
-                    if (this.getVideoId() === vid) {
-                        const v = this.getVideo();
-                        if (v) v.currentTime = note.start;
-
-                        return;
-                    }
-                    if (vid.startsWith('vod:')) {
-                        const id = vid.replace('vod:', '');
-                        const sec = Math.floor(note.start);
-                        const h = Math.floor(sec / 3600);
-                        const m = Math.floor((sec % 3600) / 60);
-                        const s = sec % 60;
-                        // Twitch expects ?t=1h2m3s format
-                        const ts = `${h}h${String(m).padStart(2, '0')}m${String(s).padStart(2, '0')}s`;
-                        window.open(`https://www.twitch.tv/videos/${id}?t=${ts}`, '_blank');
-
-                        return;
-                    }
-                    if (vid.startsWith('live:')) {
-                        window.open(`https://www.twitch.tv/${vid.replace('live:', '')}`, '_blank');
-                    }
-                }
             };
         }
 
@@ -87,12 +53,64 @@
     }
 
     // Convenience wrappers — always use fresh getSite()
-    function getVideo() { return getSite()?.getVideo(); }
-    function getVideoId() { return getSite()?.getVideoId(); }
-    function getCurrentTime() { return getSite()?.getCurrentTime() ?? 0; }
+    function getVideo() {
+        return getSite()?.getVideo();
+    }
+    function getVideoId() {
+        return getSite()?.getVideoId();
+    }
+    function getCurrentTime() {
+        return getSite()?.getCurrentTime() ?? 0;
+    }
+
+    // ---------------- NAVIGATION ----------------
+    // Routes by the note's vid prefix, NOT by current site.
+    // This fixes cross-site "go" (e.g. clicking a Twitch note while on YouTube).
+    function goToNote(note, vid) {
+        const currentVid = getVideoId();
+
+        // Same video — just seek
+        if (currentVid === vid) {
+            const v = getVideo();
+            if (v) v.currentTime = note.start;
+
+            return;
+        }
+
+        // YouTube video id: plain string with no prefix
+        if (!vid.startsWith('vod:') && !vid.startsWith('live:')) {
+            window.open(
+                `https://www.youtube.com/watch?v=${vid}&t=${Math.floor(note.start)}s`,
+                '_blank'
+            );
+
+            return;
+        }
+
+        // Twitch VOD
+        if (vid.startsWith('vod:')) {
+            const id = vid.replace('vod:', '');
+            const sec = Math.floor(note.start);
+            const h = Math.floor(sec / 3600);
+            const m = Math.floor((sec % 3600) / 60);
+            const s = sec % 60;
+            const ts = `${h}h${String(m).padStart(2, '0')}m${String(s).padStart(2, '0')}s`;
+            window.open(`https://www.twitch.tv/videos/${id}?t=${ts}`, '_blank');
+
+            return;
+        }
+
+        // Twitch live — can't seek, just open the channel
+        if (vid.startsWith('live:')) {
+            window.open(`https://www.twitch.tv/${vid.replace('live:', '')}`, '_blank');
+        }
+    }
 
     // ---------------- STORAGE ----------------
-    function getNotes() { return GM_getValue('ytNotes', {}); }
+    function getNotes() {
+        return GM_getValue('ytNotes', {});
+    }
+
     function saveNotes(d) { GM_setValue('ytNotes', d); }
 
     // ---------------- HELPERS ----------------
@@ -134,7 +152,11 @@
         const vid = getVideoId();
         const site = getSite();
 
-        if (!vid) { tip('Not a video page'); return; }
+        if (!vid) {
+            tip('Not a video page');
+
+            return;
+        }
 
         const data = getNotes(); // always fresh
 
@@ -206,6 +228,7 @@
     const saveBtn = makeLink('save');
     const toggleMode = makeLink('view');
     const exportAllBtn = makeLink('export all');
+    const importAllBtn = makeLink('import');
     const clearAllBtn = makeLink('clear all');
 
     const ta = document.createElement('textarea');
@@ -229,7 +252,14 @@
         overflow-y:auto;
         border-top:1px solid #333;
         padding-top:6px;
+        font-size:12px;
     `;
+
+    // Hidden file input for import — never shown directly, triggered by importAllBtn
+    const importFileInput = document.createElement('input');
+    importFileInput.type = 'file';
+    importFileInput.accept = '.json';
+    importFileInput.style.display = 'none';
 
     applyUIFont(header);
     applyUIFont(startBtn);
@@ -237,15 +267,17 @@
     applyUIFont(toggleMode);
     applyUIFont(exportAllBtn);
     applyUIFont(clearAllBtn);
+    applyUIFont(importAllBtn);
     applyUIFont(ta);
     applyUIFont(tagInput);
     applyUIFont(search);
     applyUIFont(list);
     applyUIFont(currentNotes);
-
     panel.appendChild(header);
     panel.appendChild(toggleMode);
     panel.appendChild(exportAllBtn);
+    panel.appendChild(importAllBtn);
+    panel.appendChild(importFileInput);
     panel.appendChild(clearAllBtn);
     panel.appendChild(startBtn);
     panel.appendChild(saveBtn);
@@ -347,6 +379,7 @@
         tagInput.style.display = isCapture ? 'block' : 'none';
 
         exportAllBtn.style.display = !isCapture ? 'inline' : 'none';
+        importAllBtn.style.display = !isCapture ? 'inline' : 'none';
         clearAllBtn.style.display = !isCapture ? 'inline' : 'none';
         search.style.display = !isCapture ? 'block' : 'none';
         list.style.display = !isCapture ? 'block' : 'none';
@@ -381,7 +414,6 @@
             clearVid.onclick = (e) => {
                 e.stopPropagation();
                 if (!confirm('Delete all notes for this video?')) return;
-
                 const d = getNotes(); // fresh read
                 delete d[vid];
                 saveNotes(d);
@@ -429,7 +461,7 @@
                 const go = document.createElement('span');
                 go.textContent = 'go';
                 go.style.cssText = 'color:#0af;cursor:pointer;margin-left:6px;';
-                go.onclick = () => getSite()?.goToNote(n, vid);
+                go.onclick = () => goToNote(n, vid);
 
                 const edit = document.createElement('span');
                 edit.textContent = ' edit';
@@ -558,7 +590,7 @@
                 go.style.cssText = 'color:#0af;cursor:pointer;margin-left:6px;';
                 go.onclick = (e) => {
                     e.stopPropagation();
-                    getSite()?.goToNote(n, vid);
+                    goToNote(n, vid);
                 };
 
                 const edit = document.createElement('span');
@@ -570,7 +602,6 @@
                     if (nt === null) return;
 
                     const tg = prompt('Tags', (n.tags || []).join(','));
-
                     const d = getNotes(); // fresh read
                     const note = d[vid]?.notes?.find(x => (x.id ?? x.created) === id);
                     if (!note) return;
@@ -642,14 +673,22 @@
     // ---------------- EVENTS ----------------
     startBtn.onclick = () => {
         const v = getVideo();
-        if (!v || v.readyState < 2) { tip('Video not ready'); return; }
+        if (!v || v.readyState < 2) {
+            tip('Video not ready');
+
+            return;
+        }
 
         startTime = getCurrentTime();
         tip(`Start: ${formatTime(startTime)}`);
     };
 
     saveBtn.onclick = () => {
-        if (startTime === null) { tip('Press Start first'); return; }
+        if (startTime === null) {
+            tip('Press Start first');
+
+            return;
+        }
 
         const end = getCurrentTime();
         saveNote(
@@ -687,6 +726,101 @@
         render();
         tip('All notes cleared');
     };
+
+    importAllBtn.onclick = () => importFileInput.click();
+
+    importFileInput.onchange = () => {
+        const file = importFileInput.files?.[0];
+        if (!file) return;
+
+        const reader = new FileReader();
+        reader.onload = (e) => {
+            let imported;
+            try {
+                imported = JSON.parse(e.target.result);
+            } catch {
+                tip('Invalid JSON file');
+
+                return;
+            }
+
+            if (typeof imported !== 'object' || Array.isArray(imported)) {
+                tip('Unrecognised format');
+
+                return;
+            }
+
+            const existing = getNotes();
+            let added = 0, merged = 0;
+
+            for (const [vid, vidData] of Object.entries(imported)) {
+                if (!vidData?.notes) continue;
+
+                if (!existing[vid]) {
+                    // Brand new video — import everything
+                    existing[vid] = vidData;
+                    added++;
+                } else {
+                    // Video already exists — merge notes by ID, skip duplicates
+                    const existingIds = new Set(
+                        existing[vid].notes.map(n => n.id ?? n.created)
+                    );
+                    for (const n of vidData.notes) {
+                        const nId = n.id ?? n.created;
+                        if (!existingIds.has(nId)) {
+                            existing[vid].notes.push(n);
+                            merged++;
+                        }
+                    }
+                }
+            }
+
+            saveNotes(existing);
+            render();
+            tip(`Imported: ${added} new video(s), ${merged} merged note(s)`);
+
+            // Reset so the same file can be imported again if needed
+            importFileInput.value = '';
+        };
+
+        reader.readAsText(file);
+    };
+
+    // ---------------- KEYBOARD SHORTCUTS ----------------
+    // Ctrl+Shift+N — start timestamp (Ctrl+N is reserved by browsers)
+    // Ctrl+Shift+S — save note
+    // Shortcuts only fire when the panel is open and in capture mode,
+    // and only when focus is NOT inside another input/textarea on the page.
+    document.addEventListener('keydown', (e) => {
+        // Allow normal typing inside the note textarea and tag input
+        const inOurInputs = (e.target === ta || e.target === tagInput);
+
+        if (e.ctrlKey && e.shiftKey && e.key === 'N') {
+            e.preventDefault();
+            if (panel.style.display === 'none') {
+                panel.style.display = 'block';
+                render();
+            }
+            if (mode !== 'capture') {
+                mode = 'capture';
+                toggleMode.textContent = 'view';
+                render();
+            }
+            startBtn.onclick();
+            ta.focus();
+
+            return;
+        }
+
+        if (e.ctrlKey && e.shiftKey && e.key === 'S') {
+            // Allow Ctrl+Shift+S only from inside our panel or when nothing else is focused
+            if (document.activeElement && !panel.contains(document.activeElement)
+                && document.activeElement !== document.body) return;
+
+            e.preventDefault();
+            saveBtn.onclick();
+        }
+    });
 
     search.oninput = () => renderViewMode();
 
